@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>سكرو</title>
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@500;700;900&family=Lalezar&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="mqtt.min.js"></script>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;height:100%;overflow:hidden;font-family:Cairo,system-ui,sans-serif;color:#fff;background:#06231b;user-select:none}
@@ -216,10 +216,9 @@ const peek=(s,c)=>{G.peeks.push({viewer:s,id:c.id});G.players[s].mem.set(c.id,c)
 
 function startGame(){
   const ps=lobby.seats.filter(s=>['human','bot','remote'].includes(s.type))
-    .map(s=>({name:s.name,kind:s.type,conn:s.conn||null,total:0,hand:[],mem:new Map()}));
+    .map(s=>({name:s.name,kind:s.type,cid:s.cid||null,away:false,total:0,hand:[],mem:new Map()}));
   if(ps.length<2)return toast('لازم لاعبين على الأقل');
   G={players:ps,maxRounds:lobby.rounds,round:0,starter:rnd(ps.length)};
-  ps.forEach((p,i)=>{if(p.conn)p.conn.seat=i});
   newRound();
 }
 function newRound(){
@@ -307,7 +306,7 @@ function makeView(seat){
     msg:G.msg,fx:G.fx,results:G.results,over:G.over};
 }
 function sync(){
-  G.players.forEach((p,i)=>{if(p.conn&&p.conn.open)p.conn.send({view:makeView(i)})});
+  stateN++;G.players.forEach((p,i)=>{if(p.cid&&!p.away)sendTo(p.cid,{view:makeView(i),seq:stateN})});
   V=makeView(me);show('game');render();botTick();
 }
 
@@ -347,60 +346,115 @@ function botPlay(s){
   act(s,{t:'pick',p:o.p,i:o.i});
 }
 
-/* ============ الشبكة (PeerJS) ============ */
-let peer=null,roomCode=null,hostConn=null;
-const PREFIX='screw-cards-';
-function openRoom(cb){
-  roomCode=Array.from({length:5},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[rnd(32)]).join('');
-  peer=new Peer(PREFIX+roomCode);
-  peer.on('open',cb);
-  peer.on('error',e=>toast('مشكلة في الاتصال: '+e.type));
-  peer.on('connection',c=>{
-    c.on('data',d=>{
-      if(!d)return;
-      if(d.join){
-        const s=lobby&&lobby.seats.find(s=>s.type==='open');
-        if(G||!s)return c.send({err:'الروم مليانة أو اللعبة بدأت'});
-        s.type='remote';s.name=String(d.join).slice(0,14)||'صديق';s.conn=c;pushLobby();
-      }else if(d.a&&G&&c.seat!=null&&G.players[c.seat]&&G.players[c.seat].conn===c)act(c.seat,d.a);
+/* ============ الشبكة (سيرفر وسيط MQTT — بيشتغل ورا أي راوتر) ============ */
+const BROKERS=(new URLSearchParams(location.search).get('broker')||'wss://broker.emqx.io:8084/mqtt,wss://broker.hivemq.com:8884/mqtt,wss://test.mosquitto.org:8081/mqtt').split(',');
+const rid=n=>Array.from({length:n},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[rnd(32)]).join('');
+let net=null,roomCode=null,myCid=null,stateN=0,lastSeq=0,seenAt={},joinT=null,hostT=null,lastHost=0,warned=false,joinTries=0;
+const T=()=>'skruu/v1/'+roomCode+'/';
+// بنتصل بكل السيرفرات مع بعض، والرسالة المكررة بتتجاهل، فلو واحد واقع الباقي يكمل
+function netStart(subTopic,onMsg,onUp){
+  netStop();
+  const n={clients:[],seen:new Set(),up:false,k:0,tag:rid(6)};net=n;
+  BROKERS.forEach(u=>{
+    let c;try{c=mqtt.connect(u,{clientId:'skruu_'+rid(10),keepalive:20,reconnectPeriod:2500,connectTimeout:9000,clean:true})}catch(e){return}
+    c.on('connect',()=>{c.subscribe(subTopic,{qos:1});if(net===n&&!n.up){n.up=true;onUp&&onUp()}});
+    c.on('message',(t,pl)=>{
+      if(net!==n)return;let d;try{d=JSON.parse(pl.toString())}catch(e){return}
+      if(!d||!d.id||n.seen.has(d.id))return;
+      n.seen.add(d.id);if(n.seen.size>600)n.seen=new Set([...n.seen].slice(-300));
+      onMsg(d);
     });
-    c.on('close',()=>drop(c));
+    c.on('error',()=>{});n.clients.push(c);
   });
+  setTimeout(()=>{if(net===n&&!n.up)toast('مش قادر أوصل لسيرفر الروم، اتأكد من النت')},12000);
 }
-function drop(c){
-  const s=lobby&&lobby.seats.find(s=>s.conn===c);
-  if(s){s.type='open';s.name='';s.conn=null}
-  if(G&&c.seat!=null){const p=G.players[c.seat];if(p&&p.conn===c){p.kind='bot';p.conn=null;p.name+=' 🤖';toast(p.name+' خرج، بوت هيكمل مكانه');sync()}}
-  else if(s&&isHost&&!G)pushLobby();
+function netStop(){
+  clearInterval(joinT);clearInterval(hostT);
+  if(net){const n=net;net=null;setTimeout(()=>n.clients.forEach(c=>{try{c.end(true)}catch(e){}}),500)}
+}
+function pub(topic,obj){
+  if(!net)return;obj.id=net.tag+(++net.k);const str=JSON.stringify(obj);
+  net.clients.forEach(c=>{if(c.connected)try{c.publish(topic,str,{qos:1})}catch(e){}});
+}
+const sendTo=(cid,obj)=>pub(T()+'dn/'+cid,obj);
+const lobbyData=()=>({code:lobby.code,rounds:lobby.rounds,seats:lobby.seats.map(({type,name})=>({type,name}))});
+
+/* ---- الهوست ---- */
+function openRoom(){
+  if(typeof mqtt==='undefined'){toast('مكتبة الاتصال ما اتحملتش، حدّث الصفحة');return false}
+  roomCode=rid(5);seenAt={};
+  netStart(T()+'up',hostMsg,()=>{if(lobby&&isHost){lobby.code=roomCode;if(!G)pushLobby()}});
+  let last=Date.now();
+  hostT=setInterval(()=>{
+    const now=Date.now();
+    if(now-last>12000)for(const k in seenAt)seenAt[k]=now;   // الهوست نفسه كان في الخلفية
+    last=now;
+    for(const k in seenAt)if(now-seenAt[k]>30000)away(k);
+  },5000);
+  return true;
+}
+function hostMsg(d){
+  const cid=d.cid;if(!cid||!lobby||!isHost)return;
+  if(d.bye)return away(cid);
+  const seat=lobby.seats.find(s=>s.cid===cid),pi=G?G.players.findIndex(p=>p.cid===cid):-1;
+  if(d.join!=null){
+    if(!seat&&pi<0){
+      const s=!G&&lobby.seats.find(s=>s.type==='open');
+      if(!s)return sendTo(cid,{err:'الروم مليانة أو اللعبة بدأت'});
+      s.type='remote';s.name=String(d.join).slice(0,14)||'صديق';s.cid=cid;seenAt[cid]=Date.now();
+      return pushLobby();
+    }
+    seenAt[cid]=Date.now();
+    if(pi>=0&&G.players[pi].away){const p=G.players[pi];p.away=false;p.kind='remote';toast(p.name+' رجع 👋');return sync()}
+    if(d.seq===stateN)sendTo(cid,{pong:1});
+    else if(G){if(pi>=0)sendTo(cid,{view:makeView(pi),seq:stateN})}
+    else sendTo(cid,{lobby:lobbyData(),seq:stateN});
+  }else if(d.a&&pi>=0){seenAt[cid]=Date.now();act(pi,d.a)}
+}
+function away(cid){
+  delete seenAt[cid];
+  if(G){const p=G.players.find(p=>p.cid===cid);if(p&&!p.away){p.away=true;p.kind='bot';toast(p.name+' خرج، بوت بيلعب مكانه لحد ما يرجع');sync()}}
+  else if(lobby){const s=lobby.seats.find(s=>s.cid===cid);if(s){s.type='open';s.name='';s.cid=null;pushLobby()}}
 }
 function pushLobby(){
-  const data={code:lobby.code,rounds:lobby.rounds,seats:lobby.seats.map(({type,name})=>({type,name}))};
-  lobby.seats.forEach(s=>{if(s.conn&&s.conn.open)s.conn.send({lobby:data})});
+  stateN++;const data=lobbyData();
+  lobby.seats.forEach(s=>{if(s.cid)sendTo(s.cid,{lobby:data,seq:stateN})});
   showLobby();
 }
+
+/* ---- اللي داخل بالكود ---- */
 function join(code){
-  if(typeof Peer==='undefined')return toast('الروم محتاجة اتصال بالإنترنت');
-  code=code.toUpperCase().trim();if(code.length<5)return toast('اكتب الكود كامل');
-  if(peer){try{peer.destroy()}catch(e){}}
-  isHost=false;G=null;toast('بنتصل...');
-  peer=new Peer();
-  peer.on('open',()=>{
-    hostConn=peer.connect(PREFIX+code,{reliable:true});
-    hostConn.on('open',()=>hostConn.send({join:myName()}));
-    hostConn.on('data',d=>{
-      if(d.err)toast(d.err);
-      if(d.lobby){lobby=d.lobby;V=null;showLobby()}
-      if(d.view){V=d.view;show('game');render()}
-    });
-    hostConn.on('close',()=>{toast('الاتصال بالهوست اتقطع');goHome()});
-  });
-  peer.on('error',e=>toast(e.type==='peer-unavailable'?'الكود غلط أو الروم مقفولة':'مشكلة اتصال: '+e.type));
+  if(typeof mqtt==='undefined')return toast('مكتبة الاتصال ما اتحملتش، حدّث الصفحة');
+  code=code.toUpperCase().replace(/[^A-Z0-9]/g,'');if(code.length<5)return toast('اكتب الكود كامل');
+  isHost=false;G=null;V=null;lobby=null;roomCode=code;myCid=rid(14);lastSeq=0;joinTries=0;warned=false;lastHost=0;
+  const name=myName();toast('بنتصل...');
+  // نفس الرسالة بتتبعت كل 3 ثواني: طلب دخول + نبض + طلب آخر حالة لو فاتتنا رسالة
+  const hello=()=>{
+    if(!net||!net.up)return;
+    pub(T()+'up',{cid:myCid,join:name,seq:lastSeq});
+    if(!lastHost){if(++joinTries>=7){toast('مفيش رد: الكود غلط أو الهوست قافل الروم');goHome()}}
+    else if(Date.now()-lastHost>20000&&!warned){warned=true;toast('الاتصال بالهوست مقطوع، بنحاول...')}
+  };
+  netStart(T()+'dn/'+myCid,d=>{
+    lastHost=Date.now();warned=false;
+    if(d.err){goHome();return toast(d.err)}
+    if(d.seq){if(d.seq<=lastSeq)return;lastSeq=d.seq}
+    if(d.lobby){lobby=d.lobby;V=null;showLobby()}
+    if(d.view){V=d.view;show('game');render()}
+  },()=>setTimeout(hello,700));
+  joinT=setInterval(hello,3000);
 }
-const send=a=>isHost?act(me,a):(hostConn&&hostConn.send({a}));
+const send=a=>isHost?act(me,a):pub(T()+'up',{cid:myCid,a});
+function leaveMsg(){
+  if(!net||!roomCode)return;
+  if(!isHost)pub(T()+'up',{cid:myCid,bye:1});
+  else if(lobby)lobby.seats.forEach(s=>{if(s.cid)sendTo(s.cid,{err:'الهوست قفل الروم'})});
+}
+window.addEventListener('pagehide',leaveMsg);
 
 /* ============ اللوبي ============ */
 function myName(){const n=$('#name').value.trim()||'أنا';try{localStorage.setItem('screwName',n)}catch(e){}return n}
-function goHome(){if(peer){try{peer.destroy()}catch(e){}}peer=null;hostConn=null;G=null;V=null;lobby=null;isHost=true;clearTimeout(botTimer);show('home')}
+function goHome(){leaveMsg();netStop();G=null;V=null;lobby=null;isHost=true;clearTimeout(botTimer);show('home')}
 function newLobby(){
   isHost=true;me=0;
   lobby={rounds:5,code:null,seats:[{type:'human',name:myName()},{type:'bot',name:BOTS[0]},{type:'bot',name:BOTS[1]},{type:'closed',name:''}]};
@@ -408,14 +462,11 @@ function newLobby(){
 }
 function cycle(i){
   const s=lobby.seats[i];
-  if(s.type==='remote'){const c=s.conn;s.conn=null;s.type='open';s.name='';try{c.close()}catch(e){}}
+  if(s.type==='remote'){const c=s.cid;s.cid=null;s.type='open';s.name='';delete seenAt[c];sendTo(c,{err:'الهوست شالك من الروم'})}
   else if(s.type==='bot'){s.type='open';s.name=''}
   else if(s.type==='open')s.type='closed';
   else{s.type='bot';s.name=BOTS[i-1]}
-  if(s.type==='open'&&!peer){
-    if(typeof Peer==='undefined'){toast('الروم محتاجة اتصال بالإنترنت');s.type='bot';s.name=BOTS[i-1]}
-    else openRoom(()=>{if(lobby){lobby.code=roomCode;pushLobby()}});
-  }
+  if(s.type==='open'&&!net&&!openRoom()){s.type='bot';s.name=BOTS[i-1]}
   pushLobby();
 }
 function showLobby(){
@@ -423,7 +474,7 @@ function showLobby(){
   const box=$('#seats');box.innerHTML='';
   lobby.seats.forEach((s,i)=>{
     const d=document.createElement('button');d.className='seat '+s.type;
-    d.textContent={human:'👤 '+s.name+' (الهوست)',remote:'🧑 '+s.name,bot:'🤖 بوت — '+s.name,open:'⏳ مستني صديق يدخل بالكود...',closed:'✖ مقفول'}[s.type];
+    d.textContent={human:'👤 '+s.name+' (الهوست)',remote:'🧑 '+s.name,bot:'🤖 بوت — '+s.name,open:lobby.code?'⏳ مستني صديق يدخل بالكود...':'⏳ بنجهّز الروم...',closed:'✖ مقفول'}[s.type];
     if(isHost&&i>0)d.onclick=()=>cycle(i);else d.disabled=true;
     box.appendChild(d);
   });
@@ -433,7 +484,7 @@ function showLobby(){
   const r=$('#rounds');r.innerHTML='';
   [3,5,7].forEach(n=>{const b=document.createElement('button');b.textContent=n+' جولات';b.className='rd'+(lobby.rounds===n?' act':'');b.onclick=()=>{lobby.rounds=n;pushLobby()};r.appendChild(b)});
 }
-function nextRound(){if(!G)return;if(G.over){G=null;V=null;pushLobby()}else newRound()}
+function nextRound(){if(!G)return;if(G.over){G=null;V=null;lobby.seats.forEach(s=>{if(s.cid&&!(s.cid in seenAt)){s.type='open';s.name='';s.cid=null}});pushLobby()}else newRound()}
 
 /* ============ الرسم ============ */
 const tbl=$('#table'),els=new Map();
